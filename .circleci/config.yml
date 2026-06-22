@@ -1,6 +1,7 @@
 version: 2.1
 
 orbs:
+  aws-cli: circleci/aws-cli@5.4.1
   prodsec: snyk/prodsec-orb@1
   gh: circleci/github-cli@2.7.2
 
@@ -247,6 +248,46 @@ jobs:
               dist/snyk-studio-${VERSION}-windows-x86_64.exe \
               dist/snyk-studio-${VERSION}-windows-arm64.exe \
               --clobber
+
+  installer-create-s3-release:
+    description: Upload installer binaries to the S3
+    environment:
+      AWS_REGION: us-east-1
+    docker:
+      - image: cimg/aws:2025.01
+    steps:
+      - checkout
+      - aws-cli/setup:
+          role_arn: "arn:aws:iam::198361731867:role/studio-recipes"
+          region: ${AWS_REGION}
+      - attach_workspace:
+          at: dist
+      - determine_version
+      - run:
+          name: Upload installer assets to S3
+          command: |
+            set -euo pipefail
+            ls -lh dist/
+
+            dest="s3://snyk-assets/ads/studio/${GITHUB_TAG}/"
+
+            files=(
+              "dist/snyk-studio-${VERSION}-linux-x86_64"
+              "dist/snyk-studio-${VERSION}-linux-arm64"
+              "dist/snyk-studio-${VERSION}-macos-arm64"
+              "dist/snyk-studio-${VERSION}-macos-x86_64"
+              "dist/snyk-studio-${VERSION}-windows-x86_64.exe"
+              "dist/snyk-studio-${VERSION}-windows-arm64.exe"
+            )
+
+            for f in "${files[@]}"; do
+              if [ ! -f "$f" ]; then
+                echo "ERROR: expected file not found: $f"
+                exit 1
+              fi
+              echo "Uploading $f -> ${dest}$(basename "$f")"
+              aws s3 cp "$f" "${dest}$(basename "$f")"
+            done
 
 commands:
   determine_version:
