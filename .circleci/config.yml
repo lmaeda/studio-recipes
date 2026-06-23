@@ -100,6 +100,11 @@ workflows:
           requires:
             - Generate Installer Artifacts
 
+      - installer-create-s3-release:
+          name: Upload Installer Binaries to S3
+          requires:
+            - Generate Installer Artifacts
+
 jobs:
   # Existing security scanning (runs on every branch).
   security-scans:
