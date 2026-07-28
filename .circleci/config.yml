@@ -43,6 +43,7 @@ workflows:
           name: Scan repository for secrets
           context:
             - snyk-bot-slack
+            - prodsec-orb-runtime
           channel: snyk-on-snyk-productinfra_agentic-dev
           filters:
             branches:
@@ -51,7 +52,9 @@ workflows:
 
       - security-scans:
           name: Security Scans
-          context: productinfra-agentic-dev-sos
+          context:
+            - productinfra-agentic-dev-sos
+            - prodsec-orb-runtime
 
       - installer-build:
           name: Build Installer Binaries
@@ -65,7 +68,9 @@ workflows:
 
       - security-scans:
           name: Security Scans
-          context: productinfra-agentic-dev-sos
+          context:
+            - productinfra-agentic-dev-sos
+            - prodsec-orb-runtime
 
       - installer-build:
           name: Build Installer Binaries
