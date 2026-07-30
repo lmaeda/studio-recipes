@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import platform_utils
 from platform_utils import STUDIO_VERSION as SNYK_STUDIO_VERSION  # noqa: E402
 from platform_utils import log as _platform_log  # noqa: E402
+from platform_utils import snyk_cli_from_sidecar  # noqa: E402
 
 WORKSPACE = ""
 CACHE_DIR = ""
@@ -129,7 +130,7 @@ def main() -> None:
             )
             return
 
-    snyk_bin = shutil.which("snyk")
+    snyk_bin = snyk_cli_from_sidecar() or shutil.which("snyk")
     if snyk_bin is None:
         log("Snyk CLI not found on PATH")
         finish("snyk_not_found", started_at=started_at)
@@ -153,6 +154,15 @@ def main() -> None:
             [snyk_bin, "code", "test", ".", "--json"],
             capture_output=True,
             text=True,
+            # snyk always emits UTF-8 JSON regardless of platform; text=True
+            # alone decodes using the ambient locale encoding instead (e.g.
+            # cp1252 on Windows), which crashes on legitimate non-ASCII
+            # characters in vulnerability descriptions (confirmed live:
+            # curly quotes in a real CVE description). errors="replace" is a
+            # belt-and-suspenders fallback if snyk ever emits something that
+            # isn't valid UTF-8.
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
             cwd=WORKSPACE,
             env=env,
