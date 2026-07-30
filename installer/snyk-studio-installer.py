@@ -14,15 +14,22 @@ Options:
     --profile <name>                           Installation profile (default, minimal, experimental)
     --ade <cursor|claude|gemini|windsurf|kiro> Target specific ADE (auto-detect if omitted)
     --workspace <path>                         Workspace root for workspace-scoped recipes
+                                               (e.g. commit-time hooks)
                                                (defaults to the enclosing git repo; skipped if neither)
     --dry-run                                  Show what would be installed without making changes
-    --uninstall                                Remove Snyk recipes from detected ADEs
+    --uninstall                                Remove Snyk recipes from detected ADEs and any resolved workspace
     --verify                                   Verify installed files and merged configs match manifest
     --read-only                                With --verify, only report prerequisite versions instead
                                                of offering to install/upgrade them
     --list                                     List available recipes and profiles
     --no-latest-deps                           Install pinned manifest dependency versions,
                                                upgrading only if missing or older than the pin
+    --cli-path <path>                          Use the standalone Snyk CLI at <path>. Skips all
+                                               Node.js/npm/nvm checks. If omitted, falls back to
+                                               npx (the default).
+    --recipes <a,b,c>                          Install exactly these recipes instead of the
+                                               profile's own list (requires
+                                               --profile experimental)
     --control-identifier <id>                  Machine/control identifier to record
     --diag-dump                                Create a diagnostic zip for Snyk support and print its path.
     --out-file <path>                          Output path for the diagnostic zip (default: timestamped zip in cwd).
@@ -44,7 +51,7 @@ import sys
 import tempfile
 from pathlib import Path
 from subprocess import run
-from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
 
 # When set (by generated install.sh / install.ps1 / install.py), manifest and recipe sources
 # live under this directory (flat layout from the release zip).
@@ -52,6 +59,9 @@ BUNDLE_ENV = "SNYK_STUDIO_BUNDLE_ROOT"
 
 GLOBAL = "global"
 WORKSPACE = "workspace"
+SECRETS_HOOK_RECIPE_ID = "secrets-precommit-hook"
+# The only profile under which --recipes may name an explicit selection.
+RECIPE_SELECTION_PROFILE = "experimental"
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -80,10 +90,29 @@ if _IS_WINDOWS:
 
 
 class Color:
-    """ANSI color codes with auto-detection of terminal support."""
+    """ANSI color codes with auto-detection of terminal support.
+
+    ``enabled`` re-detects on every read rather than being fixed once at
+    construction time. The module-level ``C`` instance below is created a
+    single time at import, long before ``main()`` runs - caching the
+    detection result there would freeze it based on whatever stdout looked
+    like at import time (e.g. under pytest, before any test's capsys
+    fixture has swapped stdout out), rather than the stdout actually in use
+    when a message gets printed.
+    """
 
     def __init__(self):
-        self.enabled = self._detect()
+        self._enabled: Optional[bool] = None
+
+    @property
+    def enabled(self) -> bool:
+        if self._enabled is not None:
+            return self._enabled
+        return self._detect()
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        self._enabled = value
 
     def _detect(self) -> bool:
         if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
@@ -162,7 +191,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--dry-run", action="store_true", help="Show what would be installed without making changes"
     )
     parser.add_argument(
-        "--uninstall", action="store_true", help="Remove Snyk recipes from detected ADEs"
+        "--uninstall",
+        action="store_true",
+        help="Remove Snyk recipes from detected ADEs and any resolved workspace",
     )
     parser.add_argument(
         "--verify",
@@ -192,13 +223,36 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cli-path",
+        default=None,
+        dest="cli_path",
+        metavar="PATH",
+        help=(
+            "Path to a standalone Snyk CLI binary. When provided, skips all "
+            "Node.js/npm/nvm checks and points MCP configs at this absolute "
+            "path instead of `npx snyk`. When omitted, the installer uses "
+            "npx (the default behavior)."
+        ),
+    )
+    parser.add_argument(
         "--workspace",
         default=None,
         help=(
-            "Workspace root for workspace-scoped recipes (e.g. sac-hooks). "
+            "Workspace root for workspace-scoped recipes (e.g. commit-time hooks). "
             "If omitted, the installer walks up from the current directory looking "
             "for a git repository; if none is found, workspace-scoped recipes are "
             "skipped."
+        ),
+    )
+    parser.add_argument(
+        "--recipes",
+        action="append",
+        default=None,
+        metavar="A,B,C",
+        help=(
+            "Comma-separated recipe identifiers to install in place of the "
+            f"profile's own recipe list. Requires --profile {RECIPE_SELECTION_PROFILE}; "
+            "run --list to see the available identifiers."
         ),
     )
     parser.add_argument(
@@ -227,7 +281,58 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         metavar="N",
         help="Include logs from workspaces active in the last N days (default: 1, minimum: 1).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.recipes = _parse_recipe_selection(parser, args.recipes)
+    return args
+
+
+def _parse_recipe_selection(
+    parser: argparse.ArgumentParser, values: Optional[List[str]]
+) -> Optional[List[str]]:
+    """Normalise ``--recipes`` values into an ordered list of unique names.
+
+    ``--recipes`` is registered with ``action="append"`` only so a repeated flag
+    can be rejected instead of silently keeping the last value. Identifiers are
+    matched exactly downstream, so nothing but surrounding whitespace is
+    stripped here, and install order comes from the manifest rather than this
+    list.
+    """
+    if values is None:
+        return None
+    if len(values) > 1:
+        parser.error("--recipes may be given only once; pass one comma-separated list")
+
+    selection: List[str] = []
+    for element in values[0].split(","):
+        name = element.strip()
+        if not name:
+            parser.error("--recipes takes a comma-separated list of recipe identifiers")
+        if name not in selection:
+            selection.append(name)
+    return selection
+
+
+def notify_unused_recipe_selection(args: argparse.Namespace) -> None:
+    """Note that a mode returning before recipe resolution ignores ``--recipes``.
+
+    These modes never validate the selection, so without the notice a typed
+    flag would be swallowed in silence.
+    """
+    if not args.recipes:
+        return
+    modes = [
+        flag
+        for flag, requested in (
+            ("--diag-dump", args.diag_dump),
+            ("--list", args.list_mode),
+            ("--verify", args.verify),
+            ("--uninstall", args.uninstall),
+        )
+        if requested
+    ]
+    if not modes:
+        return
+    print(f"  {C.yellow('NOTE')} {modes[0]} does not use --recipes; ignoring the selection")
 
 
 # =============================================================================
@@ -315,17 +420,46 @@ class Manifest:
         self.profiles: Dict[str, Any] = self.data.get("profiles", {})
         self.conflicting_resources: Dict[str, Any] = self.data.get("conflicting-resources", {})
 
-    def resolve_recipes(self, profile: str) -> List[str]:
+    def profile_recipes(self, profile: str) -> List[str]:
+        """Return the recipe ids a profile's list names, expanding ``"*"``."""
+        listed = self.profiles.get(profile, {}).get("recipes", [])
+        if "*" in listed:
+            return list(self.recipes.keys())
+        return list(listed)
+
+    def unprofiled_recipes(self) -> List[str]:
+        """Return the recipes that appear in no profile's recipe list.
+
+        These are the opt-in extras: never installed by a bare profile, always
+        nameable by ``--recipes``. A profile listing ``"*"`` covers every
+        recipe, so it empties this set rather than making ``"*"`` a name.
+        """
+        profiled: Set[str] = set()
+        for profile in self.profiles:
+            profiled.update(self.profile_recipes(profile))
+        return [r for r in self.recipes if r not in profiled]
+
+    def nameable_recipes(self, profile: str) -> List[str]:
+        """Return the identifiers ``--recipes`` accepts under *profile*.
+
+        Disabled recipes are excluded, so a name rejected for being disabled is
+        never listed back to the user as a suggestion.
+        """
+        candidates = set(self.profile_recipes(profile)) | set(self.unprofiled_recipes())
+        return [r for r in self.recipes if r in candidates and self.recipes[r].get("enabled", True)]
+
+    def resolve_recipes(self, profile: str, selection: Optional[List[str]] = None) -> List[str]:
         if profile not in self.profiles:
             print(f"Unknown profile: {profile}", file=sys.stderr)
             print(f"Available: {list(self.profiles.keys())}", file=sys.stderr)
             sys.exit(1)
 
-        profile_recipes = self.profiles[profile]["recipes"]
         all_ids = list(self.recipes.keys())
 
-        active = set(all_ids) if "*" in profile_recipes else set(profile_recipes)
-        active = {r for r in active if self.recipes[r].get("enabled", True)}
+        # An explicit selection replaces the profile's list outright; the
+        # profile then serves only as the eligibility gate applied upstream.
+        chosen = self.profile_recipes(profile) if selection is None else selection
+        active = {r for r in chosen if r in self.recipes and self.recipes[r].get("enabled", True)}
 
         # Honour each enabled recipe's `conflicts_with` list. Iterating in
         # manifest declaration order (rather than set iteration order, which
@@ -362,11 +496,10 @@ class Manifest:
 
         ``conflicts_with`` is normally a build-time concern: it just keeps a
         profile from listing two incompatible recipes at once. But if a user
-        previously installed the conflicted recipe (e.g. via
-        ``--profile default`` installing ``sai-hooks-async``) and then runs
-        the experimental profile (which installs ``sac-hooks`` declaring a
-        conflict with SAI), the old files stay on disk and double-fire
-        alongside the new install. This walks every ADE the conflicted
+        previously installed the conflicted recipe (for example, from another
+        profile) and then runs a profile with a mutually exclusive recipe, the
+        old files stay on disk and double-fire alongside the new install. This
+        walks every ADE the conflicted
         recipe ships sources for and reports the ones whose first file is
         actually present, so the installer can surface a warning + offer to
         clean up before the new install proceeds.
@@ -376,8 +509,8 @@ class Manifest:
             conflicts = self.recipes.get(active_rid, {}).get("conflicts_with", [])
             for conflicted_rid in conflicts:
                 # Workspace-scoped conflicted recipes would need a different
-                # path resolver; today the only declared conflict is sac
-                # against sai (ADE-scoped) so we only handle that case.
+                # path resolver; current declared conflicts target ADE-scoped
+                # recipes, so we only handle that case.
                 if self.is_workspace_scoped(conflicted_rid):
                     continue
                 # Check every ADE the conflicted recipe ships sources for —
@@ -630,6 +763,53 @@ class Manifest:
                 print(f"  {C.red('ERROR')} Failed to update settings file {raw_path}: {e}")
 
         return updated_paths
+
+
+def validate_recipe_selection(
+    manifest: Manifest, profile: str, selection: Optional[List[str]]
+) -> None:
+    """Reject an explicit ``--recipes`` selection the manifest cannot satisfy.
+
+    The profile gate is checked before name eligibility: opt-in recipes belong
+    to no profile, so the eligibility rule alone would make them nameable under
+    every profile.
+    """
+    if not selection:
+        return
+
+    if profile != RECIPE_SELECTION_PROFILE:
+        print(
+            f"  Error: --recipes requires --profile {RECIPE_SELECTION_PROFILE} (got '{profile}').",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    nameable = manifest.nameable_recipes(profile)
+    for name in selection:
+        if name in nameable:
+            continue
+        if name not in manifest.recipes:
+            reason = "unknown recipe"
+        elif not manifest.recipes[name].get("enabled", True):
+            reason = "recipe is disabled"
+        else:
+            reason = f"not selectable under profile '{profile}'"
+        print(f"  Error: --recipes '{name}': {reason}.", file=sys.stderr)
+        print(f"  Selectable under '{profile}': {', '.join(nameable)}", file=sys.stderr)
+        sys.exit(1)
+
+    # An over-broad profile list gets its conflict silently pruned with a NOTE,
+    # but explicit intent deserves an error.
+    selected = set(selection)
+    for name in selection:
+        for conflict in manifest.recipes[name].get("conflicts_with", []):
+            if conflict not in selected:
+                continue
+            print(
+                f"  Error: --recipes names both '{name}' and '{conflict}', which are incompatible.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 
 # =============================================================================
@@ -1129,12 +1309,87 @@ def run_command(cmd: list[str], warn: str) -> int:
         return 1
 
 
+def _cli_path_sidecar() -> Path:
+    """Return the ``~/.snyk-studio/cli-path`` path.
+
+    Wrapped in a function (rather than a module-level constant) so tests can
+    monkeypatch it without evaluating ``Path.home()`` at import time.
+    """
+    return Path.home() / ".snyk-studio" / "cli-path"
+
+
+def _sync_cli_path_sidecar(cli_path: Optional[str], dry_run: bool) -> None:
+    """Write or clear ``~/.snyk-studio/cli-path`` to reflect ``--cli-path``.
+
+    Installed SAI hooks read this file via ``platform_utils.snyk_cli_from_sidecar``
+    to locate the pinned CLI without relying on ``PATH``. Called only from
+    install/uninstall runs so ``--verify``/``--diag-dump``/``--list`` don't
+    mutate installer state.
+    """
+    sidecar = _cli_path_sidecar()
+    if dry_run:
+        action = "write" if cli_path else "clear"
+        print(f"    {C.dim(f'[dry-run] {action} sidecar: {sidecar}')}")
+        return
+    if cli_path:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(cli_path, encoding="utf-8")
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            sidecar.unlink()
+
+
+def _check_native_snyk(cli_path: str, snyk_version: Optional[str]) -> None:
+    """Verify the standalone Snyk CLI exists at ``cli_path`` and print its version.
+
+    Exits non-zero if the binary is missing or not executable. Version below
+    the pinned minimum is a warning only — the installer cannot upgrade a
+    standalone binary itself.
+    """
+    if not (os.path.isfile(cli_path) and os.access(cli_path, os.X_OK)):
+        print(
+            f"  {C.red('ERROR')} --cli-path {cli_path} is not an executable file. "
+            f"Point --cli-path at a standalone Snyk CLI binary, or omit the flag "
+            f"to use npx."
+        )
+        sys.exit(1)
+
+    try:
+        r = run(
+            [cli_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        snyk_ver_str = r.stdout.strip().splitlines()[0] if r.stdout else None
+    except Exception:
+        snyk_ver_str = None
+
+    if not snyk_ver_str:
+        print(f"  {C.yellow('WARNING')} Snyk CLI at {cli_path} did not report a version")
+        return
+
+    match = re.match(r"(\d+\.\d+\.\d+)", snyk_ver_str)
+    if snyk_version and match:
+        current = tuple(map(int, match.group(1).split(".")))
+        minimum = tuple(map(int, snyk_version.split(".")))
+        if current < minimum:
+            print(
+                f"  {C.yellow('WARNING')} Snyk CLI {snyk_ver_str} at {cli_path} "
+                f"is older than the pinned minimum {snyk_version}. Upgrade the "
+                f"standalone binary manually."
+            )
+            return
+    print(f"  {C.green('OK')} Snyk CLI {snyk_ver_str} ({cli_path})")
+
+
 def check_prerequisites(
     auto_yes: bool,
     snyk_version: Optional[str] = None,
     node_version: Optional[str] = None,
     no_latest_deps: bool = False,
     nvm_version: Optional[str] = None,
+    cli_path: Optional[str] = None,
 ) -> None:
     """Check that the required prerequisites are installed and configured. If not, attempt to install them.
 
@@ -1142,7 +1397,17 @@ def check_prerequisites(
     prerequisites; it doubles as the minimum-acceptable version. In
     ``no_latest_deps`` the installer does not upgrade to the latest dependency version when the dependency is
     missing or older.
+
+    When ``cli_path`` is set, skip all Node.js/npm/nvm checks and instead
+    verify the standalone Snyk CLI exists at that path. Errors out if missing.
     """
+
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    print(f"  {C.green('OK')} Python {py_ver}")
+
+    if cli_path:
+        _check_native_snyk(cli_path, snyk_version)
+        return
 
     warnings = 0
 
@@ -1155,9 +1420,6 @@ def check_prerequisites(
         if no_latest_deps and snyk_version:
             return f"snyk@{snyk_version}"
         return latest_label
-
-    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
-    print(f"  {C.green('OK')} Python {py_ver}")
 
     def get_snyk_path():
         return shutil.which("snyk") or _find_win_npm_executable("snyk")
@@ -1234,13 +1496,18 @@ def check_prerequisites(
 
 
 def print_prerequisite_versions(
-    snyk_version: Optional[str] = None, node_version: Optional[str] = None
+    snyk_version: Optional[str] = None,
+    node_version: Optional[str] = None,
+    cli_path: Optional[str] = None,
 ) -> None:
     """Print Python/Node/Snyk CLI versions, flagging any older than the manifest pins.
 
     Read-only: never installs, upgrades, or prompts — unlike
     ``check_prerequisites``. Used by ``--verify``, which must stay
     side-effect-free.
+
+    When ``cli_path`` is set, Node.js is not checked and the Snyk CLI is
+    probed at that path instead of via PATH.
     """
 
     def parse_version(x: str) -> tuple[int, ...]:
@@ -1248,6 +1515,32 @@ def print_prerequisite_versions(
 
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
     print(f"  {C.green('OK')} Python {py_ver}")
+
+    if cli_path:
+        if not (os.path.isfile(cli_path) and os.access(cli_path, os.X_OK)):
+            print(f"  {C.yellow('WARNING')} Snyk CLI not found at {cli_path}")
+            return
+        try:
+            r = run(
+                [cli_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            snyk_ver_str = r.stdout.strip().splitlines()[0] if r.stdout else None
+        except Exception:
+            snyk_ver_str = None
+        if not snyk_ver_str:
+            print(f"  {C.yellow('WARNING')} Snyk CLI at {cli_path} did not report a version")
+            return
+        match = re.match(r"(\d+\.\d+\.\d+)", snyk_ver_str)
+        if snyk_version and match and parse_version(match.group(1)) < parse_version(snyk_version):
+            print(
+                f"  {C.yellow('WARNING')} Snyk CLI {snyk_ver_str} is outdated (min: {snyk_version})"
+            )
+        else:
+            print(f"  {C.green('OK')} Snyk CLI {snyk_ver_str} ({cli_path})")
+        return
 
     node_ver = _get_node_version()
     if node_ver is None:
@@ -1261,7 +1554,7 @@ def print_prerequisite_versions(
         print(f"  {C.green('OK')} Node.js {'.'.join(map(str, node_ver))}")
 
     snyk_path = shutil.which("snyk") or _find_win_npm_executable("snyk")
-    snyk_ver_str: Optional[str] = None
+    snyk_ver_str = None
     if snyk_path:
         try:
             r = run(
@@ -1476,11 +1769,9 @@ def expand_install_tokens(s: str, workspace: Path) -> str:
     """Replace ``$WORKSPACE`` with the absolute workspace path.
 
     Used when materialising a ``pre_commit_integration.command`` string so the
-    shim doesn't depend on shell variable expansion at git-hook time. The SAC
-    recipe doesn't use ``$WORKSPACE`` (its command is workspace-relative so
-    the resulting `.pre-commit-config.yaml` / `.husky/pre-commit` stays
-    portable when committed), but the helper is kept for any future recipe
-    that needs an absolute path baked in.
+    shim doesn't depend on shell variable expansion at git-hook time. Recipes
+    can still use workspace-relative commands when generated hook files should
+    stay portable after being committed.
     """
     return s.replace("$WORKSPACE", str(workspace.resolve()))
 
@@ -1588,7 +1879,7 @@ def get_target_ades(
     print("  2) Claude Code")
     print("  3) Gemini Code")
     print("  4) Kiro")
-    print("  5) Codex CLI")
+    print("  5) Codex")
     print("  6) Windsurf")
     print("  7) GitHub Copilot CLI")
     print("  8) GitHub Copilot in VS Code")
@@ -1647,13 +1938,15 @@ _HOOK_EXPAND_STRATEGIES: frozenset[str] = frozenset(
 
 # Strategies whose source file carries hook commands the Windows installer
 # rewrites from ``uv run`` to ``uvw run --gui-script`` to suppress the console
-# window ``uv run`` would otherwise pop up under graphical ADEs. Includes the
-# Copilot CLI strategy, which on Windows needs both the GUI rewrite and
-# install-time $HOME expansion (its hooks run with Windows-native paths, not a
-# bash shell that would expand $HOME at hook time).
+# window ``uv run`` would otherwise pop up under graphical ADEs. Cursor is
+# intentionally excluded: Windows GUI-E2E investigation on July 27, 2026
+# showed Cursor reliably consumed hook stdout via ``uv run`` while
+# ``uvw run --gui-script`` still dropped ``followup_message`` responses.
+# Copilot CLI still needs both the GUI rewrite and install-time $HOME
+# expansion (its hooks run with Windows-native paths, not a bash shell that
+# would expand $HOME at hook time).
 _HOOK_GUI_STRATEGIES: frozenset[str] = frozenset(
     {
-        "cursor_hooks",
         "claude_settings",
         "gemini_settings",
         "kiro_settings",
@@ -1682,7 +1975,8 @@ def _should_gui_transform(strategy: str) -> bool:
 
     Applies on Windows only. Runs for both ``merge_*`` and ``unmerge_*``
     strategies so the unmerge source matches the on-disk form the installer
-    wrote.
+    wrote. Cursor is excluded on purpose: its Windows hooks now preserve the
+    canonical ``uv run`` launcher.
     """
     if not _IS_WINDOWS:
         return False
@@ -1968,6 +2262,72 @@ def _load_git_hooks(payload: PayloadContext) -> Any:
     return git_hooks
 
 
+def _display_name_from_hook_tag(tag: str) -> str:
+    words = tag.removeprefix("snyk-").replace("-", " ").title()
+    return f"Snyk {words}" if tag.startswith("snyk-") else words
+
+
+def _pre_commit_integration_parts(pci: Dict[str, Any], workspace: Path) -> Tuple[str, str, str]:
+    """Build shared hook fields from a manifest pre-commit integration block.
+
+    The bundled manifest is tested to declare a display name for every hook,
+    but keep the installer tolerant of older/external manifests that predate
+    the field.
+    """
+    tag = pci.get("tag", "snyk-secure-at-commit")
+    command = expand_install_tokens(pci["command"], workspace)
+    name = pci.get("name") or _display_name_from_hook_tag(tag)
+    return tag, command, name
+
+
+def _pre_commit_hook_spec(git_hooks: Any, pci: Dict[str, Any], workspace: Path) -> Any:
+    tag, command, name = _pre_commit_integration_parts(pci, workspace)
+    return git_hooks.HookSpec(tag=tag, command=command, name=name)
+
+
+def _has_installed_secrets_hook_files(manifest: Manifest, workspace: Path) -> bool:
+    sources = (
+        manifest.recipes.get(SECRETS_HOOK_RECIPE_ID, {}).get("sources", {}).get("workspace", {})
+    )
+    return any(
+        resolve_install_path(workspace, f["dest"]).exists() for f in sources.get("files", [])
+    )
+
+
+def _has_installed_workspace_hook_integration(
+    manifest: Manifest, payload: PayloadContext, workspace: Path, recipe_id: str
+) -> bool:
+    sources = manifest.recipes.get(recipe_id, {}).get("sources", {}).get("workspace", {})
+    pci = sources.get("pre_commit_integration")
+    if not pci:
+        return False
+    git_hooks = _load_git_hooks(payload)
+    spec = _pre_commit_hook_spec(git_hooks, pci, workspace)
+    _integration_kind, found, _path = git_hooks.verify_hook(workspace, spec)
+    return bool(found)
+
+
+def resolve_verify_recipes(
+    manifest: Manifest,
+    payload: PayloadContext,
+    profile: str,
+    workspace: Optional[Path],
+) -> List[str]:
+    recipes = manifest.resolve_recipes(profile)
+    if (
+        workspace is not None
+        and SECRETS_HOOK_RECIPE_ID not in recipes
+        and (
+            _has_installed_secrets_hook_files(manifest, workspace)
+            or _has_installed_workspace_hook_integration(
+                manifest, payload, workspace, SECRETS_HOOK_RECIPE_ID
+            )
+        )
+    ):
+        recipes.append(SECRETS_HOOK_RECIPE_ID)
+    return recipes
+
+
 def install_workspace_recipe(
     recipe_id: str,
     manifest: Manifest,
@@ -1978,7 +2338,7 @@ def install_workspace_recipe(
     """Install a recipe whose sources live under the synthetic ``workspace`` key.
 
     Files are copied relative to *workspace* and any ``pre_commit_integration``
-    block is wired up via the detected hook manager (pre-commit framework,
+    block is wired up via the detected hook integration (pre-commit framework,
     Husky, or git native).
     """
     sources = manifest.recipes.get(recipe_id, {}).get("sources", {}).get("workspace", {})
@@ -1999,19 +2359,18 @@ def install_workspace_recipe(
 
     pci = sources.get("pre_commit_integration")
     if pci:
-        command = expand_install_tokens(pci["command"], workspace)
-        tag = pci.get("tag", "snyk-secure-at-commit")
+        tag, command, _name = _pre_commit_integration_parts(pci, workspace)
         if dry_run:
             print(f"    {C.dim(f'[dry-run] pre-commit integrate ({tag}): {command}')}")
         else:
             git_hooks = _load_git_hooks(payload)
-            spec = git_hooks.HookSpec(tag=tag, command=command)
+            spec = _pre_commit_hook_spec(git_hooks, pci, workspace)
             try:
-                manager, installed, path = git_hooks.install_hook(workspace, spec)
-            except FileNotFoundError as e:
+                integration_kind, installed, path = git_hooks.install_hook(workspace, spec)
+            except (FileNotFoundError, git_hooks.HookIntegrationSkipped) as e:
                 print(f"    {C.red('ERROR')} pre-commit integration skipped: {e}")
             else:
-                label = f"{manager} -> {path}"
+                label = f"{integration_kind} -> {path}"
                 if installed:
                     print(f"    {C.green('hook installed')} {label}")
                 else:
@@ -2057,14 +2416,13 @@ def verify_workspace_recipe(
     pci = sources.get("pre_commit_integration")
     if pci:
         git_hooks = _load_git_hooks(payload)
-        command = expand_install_tokens(pci["command"], workspace)
-        spec = git_hooks.HookSpec(tag=pci.get("tag", "snyk-secure-at-commit"), command=command)
-        manager, found, path = git_hooks.verify_hook(workspace, spec)
+        spec = _pre_commit_hook_spec(git_hooks, pci, workspace)
+        integration_kind, found, path = git_hooks.verify_hook(workspace, spec)
         if found:
             shim_label = _display_path(Path(path), workspace)
-            print(f"    {C.green('OK')} pre-commit shim present ({manager}: {shim_label})")
+            print(f"    {C.green('OK')} pre-commit shim present ({integration_kind}: {shim_label})")
         else:
-            print(f"    {C.red('MISSING')} pre-commit shim ({manager})")
+            print(f"    {C.red('MISSING')} pre-commit shim ({integration_kind})")
             ok = False
     return ok
 
@@ -2090,16 +2448,15 @@ def uninstall_workspace_recipe(
 
     pci = sources.get("pre_commit_integration")
     if pci:
-        tag = pci.get("tag", "snyk-secure-at-commit")
+        tag, _command, _name = _pre_commit_integration_parts(pci, workspace)
         if dry_run:
             print(f"    {C.dim(f'[dry-run] pre-commit unintegrate ({tag})')}")
         else:
             git_hooks = _load_git_hooks(payload)
-            command = expand_install_tokens(pci["command"], workspace)
-            spec = git_hooks.HookSpec(tag=tag, command=command)
-            manager, removed, path = git_hooks.uninstall_hook(workspace, spec)
+            spec = _pre_commit_hook_spec(git_hooks, pci, workspace)
+            integration_kind, removed, path = git_hooks.uninstall_hook(workspace, spec)
             if removed:
-                print(f"    {C.green('hook removed:')} {manager} -> {path}")
+                print(f"    {C.green('hook removed:')} {integration_kind} -> {path}")
 
     files = sources.get("files", [])
     transforms = sources.get("transforms", [])
@@ -2131,8 +2488,66 @@ def uninstall_workspace_recipe(
     remove_legacy_workspace_files(sources, workspace, dry_run)
 
 
+@contextlib.contextmanager
+def _native_mcp_source(cli_path: str) -> Iterator[Path]:
+    """Yield a temp .mcp.json-shaped source with the Snyk server pointing at ``cli_path``.
+
+    Used when ``--cli-path`` is set: the merge layer still expects an on-disk
+    file, so we materialize one with the user-supplied command substituted for
+    the default ``npx -y snyk@latest`` invocation. The filename ends in
+    ``.mcp.json`` so downstream ``source.name == ".mcp.json"`` checks (e.g. in
+    the merge strategies) still match.
+    """
+    body = {
+        "mcpServers": {
+            "Snyk": {
+                "command": cli_path,
+                "args": ["mcp", "-t", "stdio"],
+            }
+        }
+    }
+    fd, name = tempfile.mkstemp(suffix=".mcp.json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        yield Path(name)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def _native_mcp_codex_source(cli_path: str) -> Iterator[Path]:
+    """Yield a temp .mcp-codex.toml with the Snyk server pointing at ``cli_path``.
+
+    Codex-specific parallel to ``_native_mcp_source``: ``merge_codex_config``
+    reads a TOML source, so we materialize a temp TOML with only the
+    ``[mcp_servers.Snyk]`` table populated. The suffix ``.mcp-codex.toml``
+    keeps the ``source.name`` gates in ``install_recipe`` / ``verify_recipe``
+    matching on the substituted file too.
+    """
+    body = f'[mcp_servers.Snyk]\ncommand = {json.dumps(cli_path)}\nargs = ["mcp", "-t", "stdio"]\n'
+    fd, name = tempfile.mkstemp(suffix=".mcp-codex.toml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+        yield Path(name)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
 def install_recipe(
-    recipe_id: str, ade: str, manifest: Manifest, payload: PayloadContext, dry_run: bool
+    recipe_id: str,
+    ade: str,
+    manifest: Manifest,
+    payload: PayloadContext,
+    dry_run: bool,
+    cli_path: Optional[str] = None,
 ) -> None:
     sources = manifest.get_sources(recipe_id, ade)
     if not sources:
@@ -2158,17 +2573,32 @@ def install_recipe(
     if cm:
         target = resolve_ade_path(ade, cm["target"])
         source = payload.resolve_src(cm["source"])
-        if sys.platform == "darwin" and ade not in CLI_ADES and source.name == ".mcp.json":
-            source = payload.resolve_src("mcp/.mcp.mac.json")
-
-        merge_config(cm["strategy"], target, source, payload, dry_run)
+        if cli_path and source.name == ".mcp.json":
+            # --cli-path wins over the darwin shell-wrapper swap: with an
+            # absolute binary path there is no npx-on-login-shell-PATH problem
+            # to work around.
+            with _native_mcp_source(cli_path) as native_src:
+                merge_config(cm["strategy"], target, native_src, payload, dry_run)
+        elif cli_path and source.name == ".mcp-codex.toml":
+            with _native_mcp_codex_source(cli_path) as native_src:
+                merge_config(cm["strategy"], target, native_src, payload, dry_run)
+        else:
+            if sys.platform == "darwin" and ade not in CLI_ADES and source.name == ".mcp.json":
+                source = payload.resolve_src("mcp/.mcp.mac.json")
+            merge_config(cm["strategy"], target, source, payload, dry_run)
         cleanup_legacy_config_merge(cm, ade, payload, dry_run)
 
     # chmod +x on Python files
     chmod_python_files(ade_home, dry_run)
 
 
-def verify_recipe(recipe_id: str, ade: str, manifest: Manifest, payload: PayloadContext) -> bool:
+def verify_recipe(
+    recipe_id: str,
+    ade: str,
+    manifest: Manifest,
+    payload: PayloadContext,
+    cli_path: Optional[str] = None,
+) -> bool:
     sources = manifest.get_sources(recipe_id, ade)
     if not sources:
         return True
@@ -2199,30 +2629,40 @@ def verify_recipe(recipe_id: str, ade: str, manifest: Manifest, payload: Payload
     if cm:
         strategy = cm["strategy"].replace("merge_", "verify_", 1)
         target = resolve_ade_path(ade, cm["target"])
-        with _expand_source(strategy, payload.resolve_src(cm["source"])) as resolved_path:
-            lib_dir = str(payload.payload_dir / "lib")
-            if lib_dir not in sys.path:
-                sys.path.insert(0, lib_dir)
-            import merge_json
+        raw_source = payload.resolve_src(cm["source"])
+        src_ctx: contextlib.AbstractContextManager[Path]
+        if cli_path and raw_source.name == ".mcp.json":
+            src_ctx = _native_mcp_source(cli_path)
+        elif cli_path and raw_source.name == ".mcp-codex.toml":
+            src_ctx = _native_mcp_codex_source(cli_path)
+        else:
+            src_ctx = contextlib.nullcontext(raw_source)
+        with src_ctx as raw:
+            with _expand_source(strategy, raw) as resolved_path:
+                lib_dir = str(payload.payload_dir / "lib")
+                if lib_dir not in sys.path:
+                    sys.path.insert(0, lib_dir)
+                import merge_json
 
-            try:
-                if (
-                    sys.platform == "darwin"
-                    and ade not in CLI_ADES
-                    and resolved_path.name == ".mcp.json"
-                ):
-                    resolved_path = payload.resolve_src("mcp/.mcp.mac.json")
+                try:
+                    if (
+                        not cli_path
+                        and sys.platform == "darwin"
+                        and ade not in CLI_ADES
+                        and resolved_path.name == ".mcp.json"
+                    ):
+                        resolved_path = payload.resolve_src("mcp/.mcp.mac.json")
 
-                merge_json.STRATEGIES[strategy](str(target), str(resolved_path))
-                print(f"    {C.green('OK')} hooks registered in {cm['target']}")
-            except (SystemExit, KeyError):
-                print(f"    {C.red('MISSING')} hooks in {cm['target']}")
-                ok = False
-            except ValueError as e:
-                print(
-                    f"    {C.red('ERROR')} Cannot update configuration, parse error in file {cm['target']}. Please fix the error: {e}"
-                )
-                ok = False
+                    merge_json.STRATEGIES[strategy](str(target), str(resolved_path))
+                    print(f"    {C.green('OK')} hooks registered in {cm['target']}")
+                except (SystemExit, KeyError):
+                    print(f"    {C.red('MISSING')} hooks in {cm['target']}")
+                    ok = False
+                except ValueError as e:
+                    print(
+                        f"    {C.red('ERROR')} Cannot update configuration, parse error in file {cm['target']}. Please fix the error: {e}"
+                    )
+                    ok = False
 
     return ok
 
@@ -2441,6 +2881,15 @@ def write_control_identifier(identifier: str, dry_run: bool) -> None:
 def main() -> None:
     args = parse_args()
 
+    if args.cli_path:
+        # Expand and absolutize so downstream consumers (MCP config, sidecar,
+        # hook resolver) all see the same absolute path — a relative
+        # `--cli-path` would validate against the installer's cwd but fail at
+        # scan time when the IDE-spawned hook runs in a different cwd.
+        args.cli_path = os.path.abspath(os.path.expanduser(args.cli_path))
+
+    notify_unused_recipe_selection(args)
+
     if args.diag_dump:
         lib_dir = str(Path(__file__).resolve().parent / "lib")
         if lib_dir not in sys.path:
@@ -2505,6 +2954,7 @@ def main() -> None:
             print_prerequisite_versions(
                 snyk_version=manifest.prerequisite_version("snyk"),
                 node_version=manifest.prerequisite_version("node"),
+                cli_path=args.cli_path,
             )
         else:
             check_prerequisites(
@@ -2513,17 +2963,18 @@ def main() -> None:
                 node_version=manifest.prerequisite_version("node"),
                 no_latest_deps=args.no_latest_deps,
                 nvm_version=manifest.prerequisite_version("nvm"),
+                cli_path=args.cli_path,
             )
         print()
         ades = get_target_ades(args.ade, args.yes)
         workspace = resolve_workspace(args.workspace)
-        recipes = manifest.resolve_recipes(args.profile)
+        recipes = resolve_verify_recipes(manifest, payload, args.profile, workspace)
         all_ok = True
         for ade in ades:
             for recipe_id in recipes:
                 if manifest.is_workspace_scoped(recipe_id):
                     continue
-                if not verify_recipe(recipe_id, ade, manifest, payload):
+                if not verify_recipe(recipe_id, ade, manifest, payload, cli_path=args.cli_path):
                     all_ok = False
         for recipe_id in recipes:
             if not manifest.is_workspace_scoped(recipe_id):
@@ -2551,13 +3002,19 @@ def main() -> None:
         node_version=manifest.prerequisite_version("node"),
         no_latest_deps=args.no_latest_deps,
         nvm_version=manifest.prerequisite_version("nvm"),
+        cli_path=args.cli_path,
     )
+    if not args.uninstall:
+        # Uninstall is per-ADE and must not clear the sidecar: other ADEs'
+        # installed hooks still depend on it. Users who want to fully purge
+        # can remove ~/.snyk-studio/ manually.
+        _sync_cli_path_sidecar(args.cli_path, args.dry_run)
     print()
 
     # ADE detection
     ades = get_target_ades(args.ade, args.yes)
 
-    # Workspace resolution for workspace-scoped recipes (e.g. sac-hooks).
+    # Workspace resolution for workspace-scoped recipes.
     # Explicit --workspace overrides everything; otherwise walk up from cwd
     # looking for a git repo; otherwise None (we'll skip workspace recipes
     # with a visible notice rather than guessing).
@@ -2596,14 +3053,34 @@ def main() -> None:
         )
 
     # Normal installation
-    recipes = manifest.resolve_recipes(args.profile)
+    validate_recipe_selection(manifest, args.profile, args.recipes)
+    recipes = manifest.resolve_recipes(args.profile, args.recipes)
+
+    # Both exits must precede the stale-conflict cleanup below, which under -y
+    # uninstalls without prompting -- failing after it would leave the machine
+    # with fewer recipes than it started with. Emptiness is checked first
+    # because `all()` over an empty list is True.
+    if not recipes:
+        print(
+            "  Error: recipe resolution produced no recipes to install.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if workspace is None and all(manifest.is_workspace_scoped(r) for r in recipes):
+        print(
+            "  Error: every selected recipe is workspace-scoped and no workspace was "
+            "resolved; pass --workspace or run inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     show_plan(ades, recipes, args.profile, manifest, workspace)
 
     # Detect stale on-disk installs of recipes that are mutually exclusive
     # with what's about to be installed. Without this check, switching
-    # profiles (e.g. default → experimental) would leave the old SAI files
-    # behind so both SAI and SAC fire at once. Warn before the user commits
-    # to the install so they can opt into cleanup with one prompt.
+    # profiles can leave old hook files behind so both old and new systems
+    # fire at once. Warn before the user commits to the install so they can
+    # opt into cleanup with one prompt.
     stale_conflicts = manifest.detect_stale_conflicts(recipes)
     if stale_conflicts:
         print()
@@ -2689,7 +3166,7 @@ def main() -> None:
         for recipe_id in recipes:
             if manifest.is_workspace_scoped(recipe_id):
                 continue
-            install_recipe(recipe_id, ade, manifest, payload, args.dry_run)
+            install_recipe(recipe_id, ade, manifest, payload, args.dry_run, cli_path=args.cli_path)
     for recipe_id in recipes:
         if not manifest.is_workspace_scoped(recipe_id):
             continue
@@ -2707,7 +3184,7 @@ def main() -> None:
             for recipe_id in recipes:
                 if manifest.is_workspace_scoped(recipe_id):
                     continue
-                if not verify_recipe(recipe_id, ade, manifest, payload):
+                if not verify_recipe(recipe_id, ade, manifest, payload, cli_path=args.cli_path):
                     all_ok = False
         for recipe_id in recipes:
             if not manifest.is_workspace_scoped(recipe_id):
