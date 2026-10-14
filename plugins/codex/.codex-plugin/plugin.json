@@ -1,0 +1,34 @@
+{
+  "name": "snyk",
+  "version": "0.1.0",
+  "description": "Snyk security scanning, remediation, dependency health, and findings export for Codex, powered by the local Snyk CLI MCP server.",
+  "author": {
+    "name": "Snyk",
+    "url": "https://snyk.io"
+  },
+  "homepage": "https://snyk.io/product/studio/",
+  "repository": "https://github.com/snyk/studio-recipes",
+  "license": "Apache-2.0",
+  "keywords": ["snyk", "security", "sast", "sca", "iac", "container", "secrets", "remediation", "sbom"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Snyk",
+    "shortDescription": "Find, fix, and export security issues with Snyk",
+    "longDescription": "Scan code, open-source dependencies, infrastructure as code, container images, and secrets with the local Snyk CLI. Fix issues with a guided remediation workflow, vet new dependencies before adding them, and export findings with their supporting evidence as structured JSON.",
+    "developerName": "Snyk",
+    "category": "Security",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://snyk.io/product/studio/",
+    "privacyPolicyURL": "https://snyk.io/policies/privacy/",
+    "termsOfServiceURL": "https://snyk.io/policies/terms-of-service/",
+    "defaultPrompt": [
+      "Scan this repo with Snyk and fix what you find",
+      "Is this package safe to add to my project?",
+      "Export Snyk findings for this repo as JSON"
+    ],
+    "composerIcon": "./assets/snyk.png",
+    "logo": "./assets/snyk.png",
+    "screenshots": []
+  }
+}
