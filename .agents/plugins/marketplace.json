@@ -1,0 +1,20 @@
+{
+  "name": "snyk-studio-recipes",
+  "interface": {
+    "displayName": "Snyk Studio Recipes"
+  },
+  "plugins": [
+    {
+      "name": "snyk",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Security"
+    }
+  ]
+}
